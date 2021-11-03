@@ -1,0 +1,206 @@
+---
+title: "Analyse de survie"
+author: "Chirac"
+date: "19/10/2021"
+output: html_document
+---
+
+# Analyse de mortalité infanto-juvénile
+
+Dans cet exemple, nous allons utiliser le jeu de données fecondite fourni par l’extension questionr. Ce jeu de données comporte trois tableaux de données : menages, femmes et enfants.
+
+
+
+
+
+```{r}
+
+library(questionr, quietly = TRUE)
+data(fecondite)
+lookfor(menages)
+lookfor(femmes)
+lookfor(enfants)
+class(menages)
+describe(menages)
+library(labelled)
+library(data.table)
+setDT(menages)
+setDT(femmes)
+setDT(enfants)
+enfants <- merge(
+  enfants,
+  femmes[, .(id_femme, date_entretien)],
+  by = "id_femme",
+  all.x = TRUE
+)
+
+# duree observation en mois
+library(lubridate, quietly = TRUE)
+enfants[, duree_observation := time_length(interval(date_naissance, date_entretien), unit = "months")]
+enfants[duree_observation < 0, date_entretien := date_entretien %m+% months(1)]
+enfants[, duree_observation := time_length(interval(date_naissance, date_entretien), unit = "months")]
+freq(enfants$age_deces)
+enfants[, age_deces_impute := age_deces + runif(.N)]
+enfants[, deces := 0]
+enfants[survie == 0, deces := 1]
+var_label(enfants$deces) <- "Est décédé ?"
+val_labels(enfants$deces) <- c(non = 0, oui = 1)
+
+enfants[, time := duree_observation]
+enfants[deces == 1, time := age_deces_impute]
+enfants <- merge(
+  enfants,
+  femmes[, .(
+    id_femme, id_menage, milieu, educ, 
+    date_naissance_mere = date_naissance, nb_enf_ideal
+  )],
+  by = "id_femme",
+  all.x = TRUE
+)
+enfants <- merge(
+  enfants,
+  menages[, .(id_menage, structure, richesse)],
+  by = "id_menage",
+  all.x = TRUE
+)
+enfants[, sexe := to_factor(sexe)]
+enfants[, richesse := to_factor(richesse)]
+freq(enfants$structure)
+enfants[, structure := to_factor(structure, drop_unused_labels = TRUE)]
+enfants[, structure := relevel(structure, "deux adultes de sexe opposé")]
+freq(enfants$educ)
+enfants[, educ2 := educ]
+enfants[educ == 3, educ2 := 2]
+val_label(enfants$educ2, 2) <- "secondaire ou plus"
+val_label(enfants$educ2, 3) <- NULL
+enfants[, educ2 := to_factor(educ2)]
+freq(enfants$educ2)
+enfants[, age_mere_naissance := time_length(
+  interval(date_naissance_mere, date_naissance), 
+  unit = "years"
+  )]
+
+enfants$gpage_mere_naissance <- cut(
+  enfants$age_mere_naissance, 
+  include.lowest = TRUE, right = FALSE,
+  breaks=c(13, 20, 30, 50)
+)
+levels(enfants$gpage_mere_naissance) <- c(
+  "19 ou moins", "20-29", "30 et plus"
+)
+enfants$gpage_mere_naissance <- relevel(enfants$gpage_mere_naissance, "20-29")
+freq(enfants$gpage_mere_naissance)
+
+setorder(enfants, id_femme, date_naissance)
+enfants[, rang := rank(date_naissance, ties.method = "max"), by = id_femme]
+enfants[, rang_apres_ideal := "non"]
+# note: unclass() requis en raison d'un bug non corrigé dans haven empéchant de comparer haven_labelled_spss et integer
+enfants[rang > unclass(nb_enf_ideal), rang_apres_ideal := "oui"]
+enfants[, rang_apres_ideal := factor(rang_apres_ideal)]
+enfants[, rang_apres_ideal := relevel(rang_apres_ideal, "non")]
+```
+
+```{r}
+enfants
+```
+
+
+#Kaplan-Meier
+
+```{r}
+library(survival)
+km_global <- survfit(Surv(time, deces) ~ 1, data = enfants)
+km_global
+
+```
+
+
+
+```{r}
+library(survminer, quietly = TRUE)
+ggsurvplot(km_global)
+```
+On peut facilement représenter à la place la courbe cumulée des évènements (l’inverse de la courbe de survie) et la table des effectifs en fonction du temps.
+
+```{r}
+ggsurvplot(km_global, fun = "event", risk.table = TRUE, surv.scale = "percent")
+```
+Pour comparer deux groupes (ici les filles et les garçons), il suffit d’indiquer la variable de comparaison à survfit.
+
+
+# Comparaison de la courbe de survie selon les sexes
+
+
+```{r}
+km_sexe <- survfit(Surv(time, deces) ~ sexe, data = enfants)
+km_sexe
+```
+
+Une fois encore, on aura recours à ggsurvplot pour représenter les courbes de survie.
+
+```{r}
+#ggsurvplot(km_sexe, conf.int = TRUE, risk.table = TRUE, pval = TRUE, data = enfants)
+
+
+ggsurvplot(km_sexe,
+          pval = TRUE, conf.int = TRUE,
+          risk.table = TRUE, # Add risk table
+          risk.table.col = "strata", # Change risk table color by groups
+          linetype = "strata", # Change line type by groups
+          surv.median.line = "hv", # Specify median survival
+          ggtheme = theme_bw(), # Change ggplot2 theme
+          palette = c("#E7B800", "#2E9FDF"))
+
+```
+
+La fonction survdiff permets de calculer le test du logrank afin de comparer des courbes de survie. La mortalité infanto-juvénile diffère-t-elle significativement selon le sexe de l’enfant ?
+
+```{r}
+survdiff(Surv(time, deces) ~ sexe, data = enfants)
+```
+
+
+
+#Modèle de Cox
+
+Un modèle de Cox se calcule aisément avec coxph{survival}.
+```{r}
+mod1 <- coxph(
+  Surv(time, deces) ~ sexe + milieu + richesse  + educ2 , 
+                      data = enfants
+)
+mod1
+
+```
+
+De nombreuses variables ne sont pas significatives. Voyons si nous pouvons, avec la fonction step, améliorer notre modèle par minimisation de l’AIC ou Akaike Information Criterion (voir la section Sélection de modèles du chapitre sur la Régression logistique).
+
+```{r}
+mod2 <- step(mod1)
+```
+
+On peut obtenir facilement les coefficients du modèle avec l’excellente fonction tidy de l’extension broom. Ne pas oublier de préciser exponentiate = TRUE. En effet, dans le cas d’un modèle de Cox, l’exponentiel des coefficients corresponds au ratio des risques instantannés ou hazard ratio (HR) en anglais.
+
+```{r}
+library(broom, quietly = TRUE)
+tidy(mod2, exponentiate = TRUE)
+```
+
+Pour représenter ces rapports de risque, on peut ici encore avoir recours à la fonction ggcoef_model de l’extension GGally
+
+```{r}
+library(GGally, quietly = TRUE)
+```
+
+
+```{r}
+ggcoef_model(mod2, exponentiate = TRUE)
+```
+L’extension survminer fournit également une fonction ggforest qui permet de représenter de manière plus esthétique et complète les coefficients d’un modèle de Cox.
+
+```{r}
+ggforest(mod2)
+```
+
+
+
